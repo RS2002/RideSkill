@@ -1,0 +1,59 @@
+{
+  "skill_name": "waiting_rank_detour_seeker",
+  "objective": "Rescue the oldest, longest-waiting orders that efficiency-seeking skills have passed over, by deliberately accepting high pickup cost and detour when an order's waiting time signals it has been repeatedly skipped.",
+  "description": "The score is dominated by a lexicographic desperation tier: an order whose waiting time exceeds successive multiples of the live solo-time scale jumps into a strictly higher band, so a truly abandoned order always outbids any fresh one regardless of cost. Within a band the skill then ADDS a reward that GROWS with normalised pickup fetch plus ride detour (capped so one huge trip cannot monopolise the fleet), meaning among equally-old orders it deliberately grabs the one that costs the most to reach — exactly the far, high-detour rescue that efficiency skills skip. Onboard riders only mildly discount the bid, never gate it, and demand pressure loosens the desperation thresholds so thin fleets rescue sooner. It prefers to wait (positive noop) only when parked in a region that historically received abandoned demand and is currently supply-starved, holding the car ready to pounce on the next stale order rather than burning itself on a fresh cheap one.",
+  "fitness_code": "def fitness(metrics):\n    # The rescue skill's signature: high mean_service_time and high detour_total\n    # achieved while still serving a meaningful number of orders.\n    # We reward ONLY scenarios where the sacrifice is real: gate on detour_per_order\n    # being above a rescue threshold, then count how many orders were completed\n    # under those costly conditions. Pure cheap throughput (low detour/order) scores\n    # near zero regardless of volume, so cherry-picking cannot win.\n    completed = metrics['completed']\n    detour_per_order = metrics['detour_total'] / max(1.0, completed)\n    svc = metrics['mean_service_time']\n    # Rescue threshold: detour/order must exceed 2 min AND svc must exceed 10 min\n    # to count as genuine rescue work (from table: rescue scenarios show ~2-7 det/order, svc 10-13)\n    rescue_gate = max(0.0, detour_per_order - 2.0) * max(0.0, svc - 10.0)\n    # Score = rescue_gate (nonzero only when BOTH sacrifice signals are present)\n    # multiplied by completed/1000 so more rescued orders win ties within the gate.\n    # At table magnitudes: f271 rescue_gate=(2.65-2)*(10.82-10)=0.65*0.82=0.53, completed=1940 -> 0.53*1.94=1.03\n    # f821 rescue_gate=(5.75-2)*(11.93-10)=3.75*1.93=7.24, completed=5701 -> 7.24*5.701=41.3\n    # f960 cherry-pick: detour/order=0 -> gate=0 -> score=0 (correctly suppressed)\n    # f1042 cheap: detour/order=1.71<2 -> gate=0 -> score=0 (correctly suppressed)\n    return rescue_gate * (completed / 1000.0)",
+  "fitness_rationale": "The fitness only rewards completed orders when detour-per-order AND mean service time both clear a rescue threshold, so it faithfully measures the objective of accepting real detour/wait sacrifice to serve neglected orders rather than cheap efficient throughput.",
+  "code": "def score(driver_obs, order, phi_ep, phi_step):\n    scale = phi_step.mean_solo_time\n    if scale <= 0:\n        scale = phi_ep.scale\n    scale = max(scale, 1e-9)\n\n    selfd = driver_obs['self']\n    cap = selfd['capacity']\n    party = order['num_passengers']\n    if party > (cap - selfd['committed_passengers']):\n        return -1e9\n\n    # Demand pressure loosens desperation thresholds: thin/busy fleets rescue sooner.\n    dp = phi_step.demand_pressure\n    press = dp / (1.0 + dp)          # 0..1\n    loosen = 1.0 - 0.35 * press      # lower band edges when busy\n\n    # ---- STAGE 1: LEXICOGRAPHIC DESPERATION TIER --------------------------\n    # Waiting time in units of the live solo-time scale. Each threshold crossed\n    # promotes the order into a STRICTLY higher band (large integer step), so an\n    # abandoned order always outbids a fresh one no matter what it costs to reach.\n    wn = order['waiting_time'] / scale\n    t1 = 0.75 * loosen\n    t2 = 1.75 * loosen\n    t3 = 3.00 * loosen\n    if wn >= t3:\n        band = 3\n    elif wn >= t2:\n        band = 2\n    elif wn >= t1:\n        band = 1\n    else:\n        band = 0\n    # Each band is worth 1000 units apart -> lexicographic dominance of older orders.\n    tier = 1000.0 * band\n\n    # ---- STAGE 2: RANK BY SACRIFICE (higher cost = higher score) ----------\n    # Among equally-desperate orders we DELIBERATELY prefer the one that costs the\n    # most to reach + carry, up to a plateau so no single monster trip monopolises\n    # the whole fleet. This is the inverse of an efficiency ranker.\n    loc = selfd['location']\n    fetch = phi_ep.dist(loc, order['origin']) / scale\n    ride = phi_ep.dist(order['origin'], order['destination']) / scale\n    cost_n = fetch + ride\n    # Saturating reward that RISES with cost: 0 at cost 0, plateaus ~1 far out.\n    sacrifice = cost_n / (1.0 + 0.6 * cost_n)\n    if sacrifice > 2.0:\n        sacrifice = 2.0\n\n    # A tiny fresh-order fallback so band-0 orders are still served (keeps volume\n    # up, which the fitness multiplies in) but always below any desperate order.\n    base = 1.0 + 0.5 * wn\n\n    # Onboard riders: SOFT discount only (rescue tolerates some diversion), never a gate.\n    onboard = sum(1 for a in selfd['assigned_order_details'] if a['onboard'])\n    onboard_pen = 1.0 / (1.0 + 0.08 * onboard)\n\n    raw = tier + base + 3.0 * sacrifice * (1.0 + 0.5 * band)\n    return raw * onboard_pen\n\n\ndef noop_score(driver_obs, phi_ep, phi_step):\n    scale = phi_step.mean_solo_time\n    if scale <= 0:\n        scale = phi_ep.scale\n    scale = max(scale, 1e-9)\n\n    selfd = driver_obs['self']\n    r = selfd['current_region']\n\n    # Waiting is worthwhile ONLY if we are parked where abandoned demand tends to\n    # land (historical od_in) and the region is currently supply-starved -- then we\n    # hold the car ready to pounce on the next stale order rather than burning it on\n    # a fresh cheap one. The floor is kept BELOW any desperate (band>=1) order value\n    # so we never idle past a genuine rescue.\n    pull = 0.5\n    if r >= 0 and phi_ep.od_orders > 0 and len(phi_ep.od_in) > r:\n        pull += 4.0 * phi_ep.od_in[r]\n    starved = False\n    if r >= 0 and len(phi_step.region_demand) > r and len(phi_step.region_supply) > r:\n        if phi_step.region_demand[r] > phi_step.region_supply[r]:\n            starved = True\n    if starved:\n        pull *= 1.6\n    else:\n        pull *= 0.6\n\n    # Cap the floor well under the desperation tiers (which start at ~1000) so a\n    # waiting car always yields to an abandoned order the instant one appears.\n    if pull > 3.0:\n        pull = 3.0\n    return pull",
+  "gen": 5,
+  "mechanism": "two-stage lexicographic: shortlist survivors by an absolute waiting-time desperation floor, then rank the desperate ones by the detour cost they force us to swallow (higher cost = higher score) with a plateau so no single order dominates",
+  "differs_from": "Closest to next_wave_gravity_wells (opportunity-cost) but inverted: instead of SUBTRACTING pickup cost, this skill ADDS it for already-desperate orders, so an expensive far pickup on a long-waited order is preferred over a cheap nearby one. Unlike every gate-then-rank pooling skill here, it never rejects on detour and never ranks by efficiency — it ranks by SACRIFICE, actively bidding on the costly rescues others drop.",
+  "operator": "mutation(desperation_endurance_rescuer)",
+  "parents": [
+    "desperation_endurance_rescuer"
+  ],
+  "audit": {
+    "status": "unresolved",
+    "verdict": "fitness_wrong",
+    "reason": "The stated objective is to MINIMISE permanently unserved orders, but the fitness pays purely for detour_per_order and mean_service_time being high, ignoring service rate entirely. The winning scenarios prove this backwards incentive: f908 scores +1041.86 with serv_rate 0.79, but f357 (serv_rate 0.207, 793 of 1706 orders abandoned) still scores +97.43 because its detour/order=5.36 and svc=23.69 clear the gates. The completed multiplier is dwarfed by the rescue_gate product — f908's gate=(10.54-2)*(28.40-10)=157 dominates over completed/1000=2.56 — so the formula rewards making each served order as expensive and slow as possible, which is the OPPOSITE of minimising unserved orders.",
+    "evidence": "serv_rate (0.207, 0.245, 0.256 on f357/f323/f773) stays low while fitness stays positive because detour/order and svc_min are high — service completion is never rewarded.",
+    "fitness_complaint": "The formula is rescue_gate*(completed/1000) where rescue_gate=(detour_per_order-2)*(svc-10). At table magnitudes the gate term ranges 0.65*13.69=~9 up to 8.54*18.4=157 and utterly dominates the completed/1000 factor (1.0-4.0), so the maximiser is driven to inflate detour/order and mean_service_time without bound while serving as few as ~1000 orders. This directly punishes the intended goal: f357 serves only 20.7% of orders yet scores positive, so the fitness's maximum sits at costly slow trips, NOT at minimising permanently unserved orders. Re-author to reward serve_rate / low-abandonment directly: e.g. score = serv_rate * completed, with detour used only as a soft tie-breaker or a mild bonus (capped, additive, small) so that a scenario serving 98% of orders always beats one serving 20%, and rescue is measured as service of high-waiting-time orders rather than as raw detour cost.",
+    "attempt": 3,
+    "searches": 3,
+    "behaviour_table": "scenario                  |  fitness | assigned | serv_rate | completed | svc_min | detour/order | revenue | gini | income_min\n------------------------------------------------------------------------------------------------------------------------------\nf357_c4_s27.69_Sat10h_rev0.028 |   +97.43 |     1706 |     0.207 |      1014 |   23.69 |         5.36 |   42412 | 0.14 |      -5.60\nf908_c9_s25.41_Wed15h_rev0.808 | +1041.86 |     5858 |     0.790 |      2561 |   28.40 |        10.54 |  127908 | 0.11 |     -17.88\nf1233_c3_s25.77_Sun17h_rev0.86 |  +180.67 |     5343 |     0.609 |      3283 |   21.56 |         4.15 |  105815 | 0.14 |      -4.46\nf323_c6_s26.83_Mon17h_rev0.026 |  +239.47 |     1944 |     0.245 |      1027 |   27.08 |         8.27 |   47206 | 0.14 |     -11.23\nf773_c8_s39.41_Wed18h_rev0.259 |   +45.58 |     3148 |     0.256 |      2967 |   17.39 |         3.85 |   43192 | 0.07 |      -7.24\nf1335_c7_s42.19_Tue14h_rev0.166 |  +154.31 |     6339 |     0.984 |      3975 |   17.39 |         4.55 |   76791 | 0.10 |      -7.89\n------------------------------------------------------------------------------------------------------------------------------"
+  },
+  "regime": "scenarios",
+  "eval_mode": "group",
+  "fitness": 1.9265988486737609,
+  "raw_fitness": 1.9265988486737609,
+  "per_scenario_adv": [
+    2.0279795123636104,
+    2.1071631170327465,
+    2.189682589787304,
+    1.9751164332625804,
+    1.0235834620965343,
+    2.2360679774997894
+  ],
+  "per_scenario_raw": [
+    97.4343157550673,
+    1041.856068401679,
+    180.6675767903829,
+    239.47117484985145,
+    45.58139728745354,
+    154.31104620912984
+  ],
+  "per_band": {
+    "fleet200-500": 2.0015479728130954,
+    "fleet500-1000": 1.5653732895646404,
+    "fleet1000-1500": 2.2128752836435464
+  },
+  "invalid_rate": 0.0,
+  "scenario_labels": [
+    "f357_c4_s27.69_Sat10h_rev0.028",
+    "f908_c9_s25.41_Wed15h_rev0.808",
+    "f1233_c3_s25.77_Sun17h_rev0.86",
+    "f323_c6_s26.83_Mon17h_rev0.026",
+    "f773_c8_s39.41_Wed18h_rev0.259",
+    "f1335_c7_s42.19_Tue14h_rev0.166"
+  ]
+}

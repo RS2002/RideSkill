@@ -1,0 +1,59 @@
+{
+  "skill_name": "freeness_option_patience",
+  "objective": "Minimise pooling detour cost per additional rider by only accepting a new order when the driver's route already passes very close to BOTH its pickup and its drop-off, so the extra rider is essentially free to serve.",
+  "description": "For a loaded car the skill computes the minimum true insertion detour across all consecutive anchor pairs, hard-rejects any order where either endpoint is far from the route or the combined detour exceeds a pressure-scaled fraction of one solo trip, then ranks survivors by the ratio party / (epsilon + best_detour) — a pure efficiency ratio that gives near-infinite value to genuinely free inserts and collapses quickly as detour grows. The noop floor is set high enough that a loaded car will not accept an order whose detour ratio merely beats zero; it must beat a floor that rises with fill and falls with demand pressure, so thin-fleet high-pressure scenes still serve riders while well-supplied scenes hold out for free pools. An empty car always accepts, ranked by inverse fetch distance, since there is no pooling detour to protect.",
+  "fitness_code": "def fitness(metrics):\n    # Reward serving more riders while keeping pooling detour tiny.\n    # detour_total is the pooling cost this skill exists to suppress;\n    # completed rewards the amortised extra riders actually delivered.\n    comp = metrics['completed']\n    detour = metrics['detour_total']\n    return comp / (1.0 + detour / 1000.0)",
+  "fitness_rationale": "The ratio directly measures the skill's core trade-off: completed riders in the numerator rewards throughput while the detour penalty in the denominator suppresses pooling cost, so variants that serve more riders with less added route length score higher.",
+  "code": "def score(driver_obs, order, phi_ep, phi_step):\n    self = driver_obs['self']\n    cap = self['capacity']\n    if cap is None or cap < 1:\n        cap = 1\n    party = order.get('num_passengers', 1)\n    committed = self.get('committed_passengers', 0)\n    if committed + party > cap:\n        return -1e9\n\n    scale = phi_step.mean_solo_time\n    if scale is None or scale <= 1e-6:\n        scale = phi_ep.scale\n    if scale is None or scale <= 1e-6:\n        scale = 1.0\n\n    d = phi_ep.dist\n    loc = self['location']\n    o_pick = order['origin']\n    o_drop = order['destination']\n    solo = d(o_pick, o_drop)\n\n    # Empty car: seed a solo trip ranked by inverse fetch\n    if committed <= 0:\n        fetch = d(loc, o_pick)\n        return party / (1.0 + fetch / scale)\n\n    # Build anchor list: location, pending pickups, then drops\n    details = self.get('assigned_order_details', []) or []\n    anchors = [loc]\n    for a in details:\n        if not a.get('onboard', False):\n            ap = a.get('origin')\n            if ap is not None:\n                anchors.append(ap)\n    for a in details:\n        ad = a.get('destination')\n        if ad is not None:\n            anchors.append(ad)\n\n    # Pressure-scaled gate: tighter when pressure is low (free inserts plentiful)\n    pressure = phi_step.demand_pressure\n    if pressure is None or pressure < 0:\n        pressure = 0.0\n    # gate relaxes from 0.20 -> 0.35 as pressure rises from 0 -> 2\n    gate_frac = 0.20 + 0.075 * min(pressure, 2.0)\n    end_max = gate_frac * scale\n\n    pick_touch = min(d(anc, o_pick) for anc in anchors)\n    drop_touch = min(d(anc, o_drop) for anc in anchors)\n    if pick_touch > end_max or drop_touch > end_max:\n        return -1e9\n    if pick_touch + drop_touch > 1.5 * end_max:\n        return -1e9\n\n    # True marginal insertion detour across all consecutive anchor pairs\n    best_detour = pick_touch + solo + drop_touch\n    n = len(anchors)\n    for i in range(n):\n        start = anchors[i]\n        if i + 1 < n:\n            end = anchors[i + 1]\n            det = d(start, o_pick) + solo + d(o_drop, end) - d(start, end)\n        else:\n            det = d(start, o_pick) + solo\n        if det < best_detour:\n            best_detour = det\n    if best_detour < 0.0:\n        best_detour = 0.0\n\n    # Efficiency ratio: party per unit of marginal detour\n    eps = 1e-3 * scale\n    return party / (eps + best_detour)\n\n\ndef noop_score(driver_obs, phi_ep, phi_step):\n    self = driver_obs['self']\n    committed = self.get('committed_passengers', 0)\n    if committed <= 0:\n        return 0.0\n    cap = self['capacity']\n    if cap is None or cap < 1:\n        cap = 1\n    fill = committed / cap\n    pressure = phi_step.demand_pressure\n    if pressure is None or pressure < 0:\n        pressure = 0.0\n    scale = phi_step.mean_solo_time\n    if scale is None or scale <= 1e-6:\n        scale = phi_ep.scale\n    if scale is None or scale <= 1e-6:\n        scale = 1.0\n    # Floor rises with fill (heavier car waits harder) and falls with pressure\n    # (high pressure = scarce free inserts, lower patience to protect throughput)\n    patience = (0.4 + 0.4 * fill) / (1.0 + 0.5 * min(pressure, 4.0))\n    # Express floor in same units as score: party / detour ~ 1 / (frac * scale)\n    return patience / (0.05 * scale)\n",
+  "gen": 5,
+  "mechanism": "patience / option value: a high noop floor that makes waiting a real choice, so the driver holds out for a genuinely dual-free insert rather than accepting any feasible order; the score is the ratio of party size to marginal detour cost, gated by a strict dual-proximity hard reject",
+  "differs_from": "closest to backhaul_adaptive_gate_dualfree, which gates on the tail-fetch from the last drop-off only; this skill instead measures the true insertion detour at every anchor position and sets the noop floor as a function of current fill AND demand pressure, so a lightly-loaded car in a low-pressure scene waits harder (higher floor) while a full car in a high-pressure scene lowers its patience threshold to protect throughput — the gate tightness and the noop floor both move together with pressure rather than being fixed",
+  "operator": "mutation(dualfree_corridor_insertion_gate)",
+  "parents": [
+    "dualfree_corridor_insertion_gate"
+  ],
+  "audit": {
+    "status": "match",
+    "verdict": "match",
+    "reason": "The table shows the skill doing exactly what was promised: detour/order is near-zero across all scenarios (0.01–0.26), confirming the dual-proximity gate is rejecting high-detour orders. Completed riders are high (2363–7727) and fitness values are strongly positive (+1687 to +4798), consistent with the efficiency-ratio objective rewarding throughput at minimal detour cost. The pressure-adaptive noop floor and gate_frac mechanism are consistent with the observed variation in service rate (0.332–0.885) across different fleet/demand conditions.",
+    "evidence": "The detour/order column (0.01–0.26 across all six scenarios) is the decisive column: it confirms the hard-reject gate is suppressing pooling detour as designed, while completed (2363–7727) confirms throughput is preserved.",
+    "fitness_complaint": "",
+    "attempt": 1,
+    "searches": 1,
+    "behaviour_table": "scenario                  |  fitness | assigned | serv_rate | completed | svc_min | detour/order | revenue | gini | income_min\n------------------------------------------------------------------------------------------------------------------------------\nf1317_c7_s25.67_Wed19h_rev0.537 | +2236.69 |     8581 |     0.770 |      7226 |   10.96 |         0.26 |  194392 | 0.12 |      -1.17\nf253_c3_s43.4_Fri09h_rev0.745 | +2132.28 |     2591 |     0.332 |      2385 |    6.45 |         0.05 |   31976 | 0.08 |       6.67\nf511_c2_s44.92_Sat19h_rev0.417 | +4798.14 |     5591 |     0.355 |      5168 |    6.11 |         0.01 |   48387 | 0.09 |       5.66\nf1279_c5_s29.53_Thu17h_rev0.179 | +3808.42 |     8969 |     0.762 |      7727 |    9.36 |         0.11 |  174904 | 0.13 |       0.73\nf270_c9_s37.68_Mon12h_rev0.497 | +1687.03 |     2605 |     0.478 |      2363 |    7.37 |         0.15 |   44218 | 0.10 |       5.86\nf926_c10_s36.87_Sun17h_rev0.285 | +3071.29 |     7769 |     0.885 |      6887 |    7.96 |         0.16 |  119413 | 0.11 |       3.86\n------------------------------------------------------------------------------------------------------------------------------"
+  },
+  "regime": "scenarios",
+  "eval_mode": "group",
+  "fitness": 1.2900501053654752,
+  "raw_fitness": 1.2900501053654752,
+  "per_scenario_adv": [
+    1.6972396173203539,
+    0.4875389518727714,
+    0.6174448322862826,
+    1.6014277398240273,
+    1.5223886414838625,
+    1.8142608494055523
+  ],
+  "per_scenario_raw": [
+    2236.686794328671,
+    2132.276871637081,
+    4798.138280021537,
+    3808.417055433806,
+    1687.0324556869084,
+    3071.293993409094
+  ],
+  "per_band": {
+    "fleet1000-1500": 1.6493336785721906,
+    "fleet200-500": 1.004963796678317,
+    "fleet500-1000": 1.2158528408459175
+  },
+  "invalid_rate": 0.0,
+  "scenario_labels": [
+    "f1317_c7_s25.67_Wed19h_rev0.537",
+    "f253_c3_s43.4_Fri09h_rev0.745",
+    "f511_c2_s44.92_Sat19h_rev0.417",
+    "f1279_c5_s29.53_Thu17h_rev0.179",
+    "f270_c9_s37.68_Mon12h_rev0.497",
+    "f926_c10_s36.87_Sun17h_rev0.285"
+  ]
+}

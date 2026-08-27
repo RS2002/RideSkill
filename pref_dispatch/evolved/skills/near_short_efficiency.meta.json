@@ -1,0 +1,61 @@
+{
+  "skill_name": "near_short_efficiency",
+  "objective": "Maximise the share of demand served by grabbing any feasible short-detour trip, pushing the service rate and assigned volume up rather than minimising per-passenger waiting and in-car time.",
+  "description": "A hard completability gate admits trips below a modest solo-time budget, rejecting only the longest commitments. Survivors are ranked by a transit-efficiency term that collapses to near-unity on almost any viable ride and strongly favours accepting whatever is feasible, with a detour term that drives detour per order to ~0 (0.00-0.21) so distance per delivery is small. The demand-pressure gate widens only slightly, so under real pressure almost all flood survives; a low noop floor makes idle cars take the first feasible order. The result is high service rate (0.361-0.922) and high assigned volume (3840-9301) with moderate mean service time (5.68-8.17 min), i.e. broad, busy coverage rather than few very fast trips.",
+  "fitness_code": "def fitness(metrics):\n    mst = metrics[\"mean_service_time\"]\n    time_score = max(0.0, min(1.0, (18.0 - mst) / 7.0))  # 1.0 at 11min, 0 at 18min\n    rate = metrics[\"service_rate\"]\n    det = metrics[\"detour_total\"]\n    det_score = max(0.0, min(1.0, (38000.0 - det) / 28000.0))  # lower detour better\n    return 2.0 * time_score + 1.5 * rate + 0.3 * det_score\n",
+  "fitness_rationale": "Mean service time is the single biggest lever and dominates the reward at weight 2.0; a tight gate plus near-pickup-short-ride ranking is exactly what drives it down, while the productive-time efficiency keeps detour low and the pressure-elastic gate and option-value noop protect the service rate.",
+  "code": "def score(driver_obs, order, phi_ep, phi_step):\n    s = driver_obs[\"self\"]\n    free = s[\"capacity\"] - s[\"committed_passengers\"]\n    if order[\"num_passengers\"] > free:\n        return -1e9\n\n    dist = phi_ep.dist\n    scale = float(phi_step.mean_solo_time)\n    if scale is None or scale <= 0:\n        scale = float(phi_ep.scale)\n    if scale <= 0:\n        scale = 1.0\n\n    pickup = dist(s[\"location\"], order[\"origin\"]) / scale\n    ride = dist(order[\"origin\"], order[\"destination\"]) / scale\n    commit = pickup + ride\n\n    # Hard completability gate in live solo-time units: accept ONLY trips this car\n    # can finish quickly. Tight in slack (dp->0) to keep mean service time low;\n    # widens modestly under pressure so the fleet keeps serving as demand rises.\n    dp = phi_step.demand_pressure\n    window = 2.0 + 2.0 * (1.0 - 1.0 / (1.0 + dp))\n    if commit > window:\n        return -1e9\n\n    # Marginal time this order injects into the car's existing commitments: every\n    # held (not-yet-picked) rider's wait grows by the pickup deadhead, every onboard\n    # rider rides that much longer, and the new rider's own in-car time is `ride`.\n    held = 0.0\n    onboard = 0.0\n    for d in s[\"assigned_order_details\"]:\n        if d.get(\"onboard\", False):\n            onboard += 1.0\n        else:\n            held += 1.0\n    if held + onboard > 0:\n        marginal = pickup * (held + onboard) + ride\n    else:\n        marginal = ride + 0.15 * pickup  # fresh car: only light deadhead cost\n\n    # Productive-time efficiency: share of the NEW time this trip injects that is\n    # actually spent moving the new rider. Short, near-pickup, low-queue trips win.\n    efficiency = ride / max(1e-9, marginal)\n\n    # Soonest completion: the shortest total commitment finishes everyone first.\n    soonest = 1.0 / (1.0 + commit)\n\n    # Region-flow prior: if last hour's OD shows this destination absorbed many\n    # orders, the car drops off inside a re-demanded zone (fast next pickup);\n    # strongly-favoured historical flows keep the pool dense.\n    prior = 0.0\n    if phi_ep.od_orders:\n        o = order[\"origin_region\"]\n        d = order[\"destination_region\"]\n        if o >= 0 and d >= 0:\n            flow = float(phi_ep.od_count[o][d])\n            re_dem = float(phi_ep.od_in[d])\n            prior = 0.15 * min(1.0, flow * float(phi_ep.od_orders) / 40.0) + 0.10 * min(1.0, re_dem * 8.0)\n\n    # Already-waiting rider: a longer waiting_time means serving it reduces\n    # waiting fastest.\n    prior += 0.10 * min(1.0, float(order.get(\"waiting_time\", 0.0)) / scale)\n\n    return efficiency + soonest + prior\n\n\ndef noop_score(driver_obs, phi_ep, phi_step):\n    s = driver_obs[\"self\"]\n    scale = float(phi_step.mean_solo_time)\n    if scale is None or scale <= 0:\n        scale = float(phi_ep.scale)\n    if scale <= 0:\n        scale = 1.0\n    dp = phi_step.demand_pressure\n\n    # Base patience (option value of waiting): in slack hours hold out for a\n    # near-short match (protects mean service time); under pressure stop waiting and\n    # grab the first feasible order so the fleet keeps serving.\n    base = 0.30 + 0.50 * (1.0 - dp / (1.0 + dp))\n\n    # Local option value: an idle car in a region with plenty of pending orders per\n    # idle competitor has excellent near-term prospects -> raise the floor and wait;\n    # in an oversupplied region lower it and take what comes.\n    local = 0.0\n    r = s[\"current_region\"]\n    if (r >= 0 and phi_step.region_supply and phi_step.region_demand\n            and r < len(phi_step.region_supply) and r < len(phi_step.region_demand)):\n        sup = max(float(phi_step.region_supply[r]), 0.01)\n        dem = float(phi_step.region_demand[r])\n        comp = dem / sup\n        local = 0.35 * min(1.0, max(0.0, comp - 1.0) * 0.5)\n\n    # Onboard-deadline ceiling: if a rider aboard must be dropped soon, refuse to\n    # let this car's route grow this step at all.\n    etas = [d[\"eta\"] for d in s[\"assigned_order_details\"] if d.get(\"eta\") is not None]\n    deadline = 0.0\n    if etas:\n        min_eta = min(etas) / scale\n        deadline = max(0.0, 2.0 / (1.0 + min_eta))\n\n    return base + local + deadline",
+  "gen": 3,
+  "mechanism": "hard completability gate then rank by marginal productive-time efficiency, with an OD-region re-demand prior tiebreak and a region-aware option-value noop",
+  "differs_from": "Closest to the repository's hard-gate-then-rank family, but the opposite of gowin_ratio_gate: that skill's hard gate only bounds commitment and then RANKS by fare-per-pickup so it aggressively takes long high-fare trips, while this skill tightens the gate far below the fare variant and ranks survivors by what fraction of the new time it injects actually moves the new rider, so short near-pickup rides win and long hauls are outright rejected rather than merely deprioritised.",
+  "operator": "mutation(soonest_ride_hunter)",
+  "parents": [
+    "soonest_ride_hunter"
+  ],
+  "audit": {
+    "status": "description_wrong",
+    "verdict": "description_wrong",
+    "reason": "The table shows the 'soonest' outcome is achieved by maximising assignment volume, not by serving riders who can be picked up and dropped off soonest. Service times are moderate (5.68-8.17 min) while detours collapse toward ~0, and the top fitness scenarios combine very high service rates (0.858, 0.922) with high volumes the noop and gate were meant to restrain. Fitness correlates with service rate and volume (0.858/0.922 win), not with low mean service time, so the stated driver is not what wins.",
+    "evidence": "Rows f1199 (rate 0.858, +3.59) and f1452 (rate 0.922, +3.68) score highest despite the noop clamping demand; low-rate rows earn less regardless of svc_min.",
+    "fitness_complaint": "",
+    "attempt": 1,
+    "searches": 1,
+    "behaviour_table": "scenario                  |  fitness | assigned | serv_rate | completed | svc_min | detour/order | revenue | gini | income_min\n------------------------------------------------------------------------------------------------------------------------------\nf392_c8_s32.13_Thu19h_rev0.075 |    +2.84 |     4488 |     0.361 |      4197 |    5.68 |         0.05 |   39862 | 0.09 |       2.16\nf511_c1_s34.72_Sat14h_rev0.945 |    +3.14 |     5135 |     0.562 |      4719 |    6.27 |         0.00 |   21749 | 0.09 |       4.74\nf1199_c10_s42.52_Wed08h_rev0.093 |    +3.59 |     9301 |     0.858 |      8729 |    6.28 |         0.16 |   98585 | 0.16 |       0.61\nf375_c9_s38.97_Mon12h_rev0.507 |    +3.36 |     3840 |     0.705 |      3541 |    6.15 |         0.02 |   38539 | 0.09 |       6.08\nf511_c3_s33.52_Fri10h_rev0.422 |    +3.26 |     4691 |     0.643 |      4268 |    6.85 |         0.04 |   42855 | 0.09 |       5.57\nf1452_c2_s33.31_Fri16h_rev0.415 |    +3.68 |     8559 |     0.922 |      7539 |    8.17 |         0.21 |   73781 | 0.17 |       0.55\n------------------------------------------------------------------------------------------------------------------------------",
+    "original_objective": "Minimise passenger waiting and in-car time by accepting only trips the car can pick up and deliver soonest, favouring short, low-detour commitments over long ones.",
+    "original_description": "A hard completability gate rejects any trip whose total pickup-plus-ride commitment exceeds a tight live-solo-time budget (kept tight in slack hours to protect mean service time, widened only modestly as demand pressure rises so the fleet keeps serving). Survivors are ranked by marginal productive-time efficiency: each held or onboard rider's time grows by the pickup deadhead this order injects, so the score favours short rides from a nearby pickup that spend almost all added time moving the new passenger, and the shortest total commitment finishes everyone soonest. An OD prior rewards dropping a passenger inside a region that absorbed many orders last hour and, weighted by live per-region wins, pushes waiting cars toward a re-demanded area. The noop floor is a real option value: high in slack hours so the car holds out for a near-short match, low under pressure so it grabs the first feasible order, higher still when its own region has plentiful pending orders per idle competitor, and a hard ceiling whenever an onboard rider must be dropped imminently."
+  },
+  "regime": "scenarios",
+  "eval_mode": "group",
+  "fitness": 0.7516892162225949,
+  "raw_fitness": 0.7516892162225949,
+  "per_scenario_adv": [
+    1.2752754308375984,
+    0.7806025557932,
+    1.2888677210467905,
+    -0.002914589987542881,
+    0.6428252444394174,
+    0.5254789352061058
+  ],
+  "per_scenario_raw": [
+    2.8419853473955397,
+    3.1429087327642806,
+    3.5871574868530303,
+    3.3572687224669604,
+    3.2645647703906784,
+    3.683459051724138
+  ],
+  "per_band": {
+    "fleet200-500": 0.6361804204250278,
+    "fleet500-1000": 0.7117139001163086,
+    "fleet1000-1500": 0.9071733281264481
+  },
+  "invalid_rate": 0.0,
+  "scenario_labels": [
+    "f392_c8_s32.13_Thu19h_rev0.075",
+    "f511_c1_s34.72_Sat14h_rev0.945",
+    "f1199_c10_s42.52_Wed08h_rev0.093",
+    "f375_c9_s38.97_Mon12h_rev0.507",
+    "f511_c3_s33.52_Fri10h_rev0.422",
+    "f1452_c2_s33.31_Fri16h_rev0.415"
+  ]
+}

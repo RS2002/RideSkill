@@ -1,0 +1,8 @@
+ride-gym>=0.1.0
+numpy>=1.24
+pandas>=2.0
+pyarrow>=14.0
+networkx>=3.0
+openai>=1.30          # training only (OpenAI-compatible chat client)
+python-dotenv>=1.0    # training only (.env key loading)
+matplotlib>=3.7       # figures only

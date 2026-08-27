@@ -1,0 +1,256 @@
+{
+  "skill_name": "dualmech_od_reach_hybrid_scorer",
+  "objective": "Score each candidate region by objective-priced, supply-netted near-future demand (live eff_demand plus seat/OD-weighted pending pool) minus a fairness-reach-scaled, empty-averse-stiffened cruise penalty, switching emphasis by what `w` pays for.",
+  "objective_read_check": "The scorer probes `w` for trip value, empty-cruise cost, seat value and assignment value, then forms cruise_w, seat_frac and thru_frac. Under a seating w (high seat_frac) the OD-inflow structural prior and multi-party pending pool are amplified so regions where trips habitually END win the argmax; under a throughput w (high thru_frac) raw pending demand and proximity dominate; under an empty/completion-gated w (high cruise_w) the penalty is stiffened on long cruises so only imminently-reachable hotspots survive -- so a different w changes which region tops the ranking, not merely its magnitude.",
+  "description": "It buckets live pending orders and eff_demand by region, nets against neighbourhood free supply, and adds an OD-inflow structural prior weighted by demand-pressure. Parent A's mechanism (stiff empty-averse penalty, boosted-rival discount, and a park margin that rises with cruise price) governs costly-cruise / strong-fairness cells; parent B's mechanism (OD-inflow prior scaled by od_orders and a demand-multiplier from the fairness budget) governs raw/completion cells. Fairness reach extends demand-chasing for boosted (poor) cars and damps rich cars parked on hotspots at high strength; it returns {} to keep a car put whenever the best move fails to beat staying by a cruise-priced margin.",
+  "reposition_understanding": "A region is worth cruising an idle empty car toward when it has genuine near-future pickup demand (live under-served eff_demand or a habitual origin per the OD prior) that this car can reach before the demand evaporates, and where free supply is not already plentiful. A service-maximising scorer prices that demand in the units the current objective `w` actually pays (finished trips, seats, or raw throughput), subtracts an empty-cruise penalty scaled by how costly `w` makes empty moves and by the driver's fairness reach, and refuses to move when the best target barely beats staying put.",
+  "code": "def reposition_scores(driver_obs, phi_ep, phi_step, kappa, w):\n    self = driver_obs.get('self', {})\n    cur = self.get('current_region', -1)\n    if cur is None or cur < 0:\n        return {}\n    rp = driver_obs.get('relocation_points', ())\n    n = len(rp)\n    if n == 0:\n        return {}\n    loc = self.get('location')\n    scale = None\n    try:\n        scale = float(phi_step.mean_solo_time)\n    except:\n        scale = None\n    if scale is None or scale <= 1e-6:\n        try:\n            scale = float(phi_ep.scale)\n        except:\n            scale = None\n    if scale is None or scale <= 1e-6:\n        scale = 7.0\n    scale = float(scale)\n    trip_val = 1.0\n    empty_cost = 0.30\n    seat_val = 0.0\n    assign_val = 0.0\n    if w is not None:\n        try:\n            base = float(w({'assigned_orders': [], 'assigned_party_sizes': {},\n                     'assigned_solo_times': {}, 'assigned_service_times': {},\n                     'completed_orders': [], 'picked_up_orders': [],\n                     'distance_moved': 0.0, 'time_moved': 0.0,\n                     'is_empty_move': False, 'is_idle_wait': False,\n                     'extra_detour_time': 0.0}))\n            done = float(w({'assigned_orders': [1], 'assigned_party_sizes': {1: 1},\n                     'assigned_solo_times': {1: scale}, 'assigned_service_times': {1: scale},\n                     'completed_orders': [1], 'picked_up_orders': [1],\n                     'distance_moved': 0.0, 'time_moved': 0.0,\n                     'is_empty_move': False, 'is_idle_wait': False,\n                     'extra_detour_time': 0.0}))\n            trip_val = abs(done - base)\n            if not trip_val > 1e-9:\n                trip_val = 1.0\n            emv = float(w({'assigned_orders': [], 'assigned_party_sizes': {},\n                     'assigned_solo_times': {}, 'assigned_service_times': {},\n                     'completed_orders': [], 'picked_up_orders': [],\n                     'distance_moved': scale, 'time_moved': scale,\n                     'is_empty_move': True, 'is_idle_wait': False,\n                     'extra_detour_time': 0.0}))\n            ec = base - emv\n            if ec > 0:\n                empty_cost = ec\n            seat = float(w({'assigned_orders': [1], 'assigned_party_sizes': {1: 3},\n                     'assigned_solo_times': {1: scale}, 'assigned_service_times': {1: scale},\n                     'completed_orders': [1], 'picked_up_orders': [1],\n                     'distance_moved': 0.0, 'time_moved': 0.0,\n                     'is_empty_move': False, 'is_idle_wait': False,\n                     'extra_detour_time': 0.0}))\n            seat_val = abs(seat - base) - trip_val\n            if seat_val < 0:\n                seat_val = 0.0\n            asg = float(w({'assigned_orders': [1], 'assigned_party_sizes': {1: 1},\n                     'assigned_solo_times': {1: scale}, 'assigned_service_times': {1: scale},\n                     'completed_orders': [], 'picked_up_orders': [],\n                     'distance_moved': 0.0, 'time_moved': 0.0,\n                     'is_empty_move': False, 'is_idle_wait': False,\n                     'extra_detour_time': 0.0}))\n            assign_val = abs(asg - base)\n        except:\n            trip_val = 1.0\n            empty_cost = 0.30\n            seat_val = 0.0\n            assign_val = 0.0\n    cruise_w = empty_cost / trip_val\n    if cruise_w < 0.05:\n        cruise_w = 0.05\n    if cruise_w > 4.0:\n        cruise_w = 4.0\n    empty_averse = cruise_w > 0.5\n    seat_frac = seat_val / trip_val\n    if seat_frac < 0:\n        seat_frac = 0.0\n    if seat_frac > 2.0:\n        seat_frac = 2.0\n    thru_frac = assign_val / trip_val\n    if thru_frac < 0:\n        thru_frac = 0.0\n    if thru_frac > 2.0:\n        thru_frac = 2.0\n    fb = driver_obs.get('fairness_budget', 1.0)\n    try:\n        fb = float(fb)\n    except:\n        fb = 1.0\n    if fb <= 0:\n        fb = 1.0\n    fs = 0.0\n    try:\n        fs = float(phi_ep.fairness_strength)\n    except:\n        fs = 0.0\n    reach = 1.0\n    if fs > 0.0:\n        reach = 1.0 + 0.6 * (fb - 1.0) * min(fs, 2.0)\n        if reach < 0.4:\n            reach = 0.4\n        if reach > 2.5:\n            reach = 2.5\n    dem_mult = 1.0\n    if fs > 0.0:\n        dem_mult = 1.0 + 0.6 * fs * (fb - 1.0)\n        if dem_mult < 0.3:\n            dem_mult = 0.3\n        if dem_mult > 2.0:\n            dem_mult = 2.0\n    dbud = driver_obs.get('driver_budgets', {})\n    alldr = driver_obs.get('all_drivers', {})\n    od_in = None\n    od_out = None\n    od_orders = 0.0\n    try:\n        if phi_ep.od_orders and float(phi_ep.od_orders) > 0:\n            od_in = phi_ep.od_in\n            od_out = phi_ep.od_out\n            od_orders = float(phi_ep.od_orders)\n    except:\n        od_in = None\n        od_out = None\n        od_orders = 0.0\n    dp = 0.0\n    try:\n        dp = float(phi_step.demand_pressure)\n    except:\n        dp = 0.0\n    if dp < 0:\n        dp = 0.0\n    dp_ramp = dp / (dp + 2.0)\n    if dp_ramp > 1.0:\n        dp_ramp = 1.0\n    pend = driver_obs.get('pending_orders', [])\n    reg_pax = {}\n    reg_cnt = {}\n    reg_multi = {}\n    for o in pend:\n        try:\n            orr = o.get('origin_region', -1)\n        except:\n            continue\n        if orr is None or orr < 0:\n            continue\n        try:\n            npax = float(o.get('num_passengers', 1))\n        except:\n            npax = 1.0\n        if npax < 1:\n            npax = 1.0\n        reg_pax[orr] = reg_pax.get(orr, 0.0) + npax\n        reg_cnt[orr] = reg_cnt.get(orr, 0.0) + 1.0\n        if npax >= 2.0:\n            reg_multi[orr] = reg_multi.get(orr, 0.0) + npax\n    nb = driver_obs.get('region_neighbours', ())\n    cands = set()\n    cands.add(cur)\n    try:\n        if cur < len(nb):\n            for x in nb[cur]:\n                if 0 <= x < n:\n                    cands.add(x)\n    except:\n        pass\n    try:\n        ed = kappa.eff_demand\n        order = sorted(range(n), key=lambda r: -float(ed[r]))\n        for r in order[:6]:\n            cands.add(r)\n    except:\n        pass\n    def cap_supply(r):\n        try:\n            return float(kappa.supply[r])\n        except:\n            return 0.0\n    def cap_eff(r):\n        try:\n            return float(kappa.eff_demand[r])\n        except:\n            return 0.0\n    def nb_supply(r):\n        s = cap_supply(r)\n        try:\n            if r < len(nb):\n                for x in nb[r]:\n                    if 0 <= x < n:\n                        s += 0.5 * cap_supply(x)\n        except:\n            pass\n        return s\n    def boosted_rivals(r):\n        c = 0.0\n        try:\n            for did, dv in alldr.items():\n                st = dv.get('status', '')\n                if st not in ('idle', 'relocating'):\n                    continue\n                bud = 1.0\n                try:\n                    bud = float(dbud.get(did, 1.0))\n                except:\n                    bud = 1.0\n                if bud > 1.05:\n                    dl = dv.get('location')\n                    if dl is not None:\n                        try:\n                            if float(phi_ep.dist(dl, rp[r])) <= scale:\n                                c += (bud - 1.0)\n                        except:\n                            pass\n        except:\n            pass\n        return c\n    scores = {}\n    best = None\n    best_r = None\n    cur_val = None\n    for r in sorted(cands):\n        if r is None or r < 0 or r >= n:\n            continue\n        eff = cap_eff(r)\n        pax = reg_pax.get(r, 0.0)\n        cnt = reg_cnt.get(r, 0.0)\n        multi = reg_multi.get(r, 0.0)\n        prior = 0.0\n        if od_in is not None:\n            try:\n                prior += float(od_in[r]) * 4.0\n            except:\n                pass\n            try:\n                prior += float(od_out[r]) * 1.0\n            except:\n                pass\n        prior_units = (0.35 * dp_ramp + 0.65) * prior * od_orders * 0.02\n        # A-mechanism: objective-priced supply-netted demand w/ seat+throughput weighting\n        demand = eff + thru_frac * cnt + 0.3 * pax\n        # B-mechanism: seat_frac lifts multi-party + OD-inflow structural prior\n        demand = demand + seat_frac * (multi + 0.5 * prior_units) + prior_units\n        if demand <= 0:\n            demand = eff + 0.5 * prior_units\n        demand = demand * dem_mult\n        supp = nb_supply(r)\n        net = demand - 0.6 * supp\n        if fs > 0.5:\n            net = net - 0.4 * boosted_rivals(r)\n        t = scale\n        if loc is not None:\n            try:\n                t = float(phi_ep.dist(loc, rp[r]))\n            except:\n                t = scale\n        if not t >= 0:\n            t = scale\n        cruise_units = t / scale\n        penalty = cruise_w * cruise_units / reach\n        if empty_averse and cruise_units > 1.0:\n            penalty = penalty * (1.0 + 0.4 * (cruise_units - 1.0))\n        val = net - penalty\n        if fs > 1.0 and fb < 1.0:\n            val = val * max(fb, 0.3)\n        try:\n            valf = float(val)\n        except:\n            continue\n        if not np.isfinite(valf):\n            continue\n        scores[r] = valf\n        if r == cur:\n            cur_val = valf\n        if best is None or valf > best:\n            best = valf\n            best_r = r\n    if best is None:\n        return {}\n    stay = cur_val if cur_val is not None else 0.0\n    margin = 0.12 * (1.0 + 0.6 * cruise_w)\n    if best_r == cur:\n        return {}\n    if best - stay <= margin or best <= margin:\n        return {}\n    out = {}\n    for r, v in scores.items():\n        if np.isfinite(v):\n            out[int(r)] = float(v)\n    return out\n",
+  "gen": 7,
+  "operator": "crossover(child_dualmechanism_reach_scorer x objective_fair_demand_gravity_hybrid)",
+  "parents": [
+    "child_dualmechanism_reach_scorer",
+    "objective_fair_demand_gravity_hybrid"
+  ],
+  "policy_audit": {
+    "status": "mixed",
+    "verdict": "mixed",
+    "reason": "The arms clearly differ when handed the objective, but the direction only follows the price list in cell 2, where the seat/pickup objective yields relocation_moves -25.5%, detour -33.1% and income +1.8%. In the three dispatch-wait cells (1,3,4) the given arm moves against the objective: cell 1 detour +834% with completed -4.0%, cell 3 income -7.7%/revenue -9.6%/completed -5.5%, and cell 4 detour +204.8% with income -6.2% and service_rate -5.7%. So handing over the wait objectives shrinks service and inflates detour rather than cutting priced platform wait.",
+    "evidence": "Cell 2 (relocation_moves, detour, income) aligns; cells 1, 3 and 4 (detour_total, completed, income) move opposite to the wait price.",
+    "per_cell": [
+      {
+        "cell": 1,
+        "moved": "yes",
+        "note": "detour_total jumps +834% (425.8→3,977) while completed falls -4.0% and service_rate -1.9%; the objective pays for cutting party-weighted dispatch wait, but the given arm delivers fewer orders with far more pooling detour, the opposite of what's priced."
+      },
+      {
+        "cell": 2,
+        "moved": "yes",
+        "note": "relocation_moves -25.5% (1,594→1,188), reposition_distance_ratio -23.6%, detour -33.1%, with income +1.8% and revenue +1.2%; the seat-pay/pickup-charge objective is served by fewer empty repositioning moves and less detour."
+      },
+      {
+        "cell": 3,
+        "moved": "yes",
+        "note": "detour_total -54.9% (2,089→942) and relocation_moves -15.2%, but income -7.7%, revenue -9.6% and completed -5.5%; the heavy-wait objective sees fewer deliveries and lower income, not the promised wait reduction."
+      },
+      {
+        "cell": 4,
+        "moved": "yes",
+        "note": "detour_total +204.8% (201→612.6), income -6.2%, completed -5.8%, service_rate -5.7%; the wait-penalising objective produces more detour and fewer completions, contradicting what it pays for."
+      }
+    ],
+    "cells": [
+      {
+        "scene": "537 cars, capacity 2, 28.07 km/h, hour Wednesday 08:00, seed 555, fairness strength 0",
+        "objective": "nl(Charge heavily for every minute ...)",
+        "scenario": "f537_c2_s28.07_Wed08h_rev0.192",
+        "family": "nl",
+        "strength": 0.0,
+        "arms": {
+          "w hidden": {
+            "income_mean": -12.278988206083177,
+            "assigned": 5111.0,
+            "completed": 4657.0,
+            "service_rate": 0.4715379647568964,
+            "mean_service_time": 7.025771454926462,
+            "detour_total": 425.79352841774835,
+            "revenue": 36458.10981257686,
+            "income_gini": 0.14507908709153194,
+            "wage_gini": 0.09708892217995091,
+            "relocation_moves": 1150.0,
+            "reposition_distance_ratio": 0.11094118965968429
+          },
+          "w given": {
+            "income_mean": -12.224705152079455,
+            "assigned": 5013.0,
+            "completed": 4472.0,
+            "service_rate": 0.46249654027124276,
+            "mean_service_time": 7.618553905685153,
+            "detour_total": 3977.0167507896654,
+            "revenue": 36394.21027773341,
+            "income_gini": 0.15386256379859975,
+            "wage_gini": 0.10889359094086881,
+            "relocation_moves": 1119.0,
+            "reposition_distance_ratio": 0.11538637884147233
+          },
+          "w given, fairness 0": {
+            "income_mean": -12.224705152079455,
+            "assigned": 5013.0,
+            "completed": 4472.0,
+            "service_rate": 0.46249654027124276,
+            "mean_service_time": 7.618553905685153,
+            "detour_total": 3977.0167507896654,
+            "revenue": 36394.21027773341,
+            "income_gini": 0.15386256379859975,
+            "wage_gini": 0.10889359094086881,
+            "relocation_moves": 1119.0,
+            "reposition_distance_ratio": 0.11538637884147233
+          }
+        }
+      },
+      {
+        "scene": "852 cars, capacity 5, 37 km/h, hour Wednesday 19:00, seed 556, fairness strength 0.233678",
+        "objective": "nl(Pay per shared seat filled and c...)",
+        "scenario": "f852_c5_s37_Wed19h_rev0.841",
+        "family": "nl",
+        "strength": 0.23367798820747238,
+        "arms": {
+          "w hidden": {
+            "income_mean": 18.16023140429069,
+            "assigned": 9144.0,
+            "completed": 8229.0,
+            "service_rate": 0.8203103974163451,
+            "mean_service_time": 6.775600032472147,
+            "detour_total": 3398.2340580167242,
+            "revenue": 104086.92777243258,
+            "income_gini": 0.11321411604784215,
+            "wage_gini": 0.12008201703504495,
+            "relocation_moves": 1594.0,
+            "reposition_distance_ratio": 0.10572322384851078
+          },
+          "w given": {
+            "income_mean": 18.490928662205505,
+            "assigned": 8780.0,
+            "completed": 7953.0,
+            "service_rate": 0.7876558715349421,
+            "mean_service_time": 6.636475852094857,
+            "detour_total": 2273.7708278428313,
+            "revenue": 105377.5086054706,
+            "income_gini": 0.1044634251876746,
+            "wage_gini": 0.1024545991392487,
+            "relocation_moves": 1188.0,
+            "reposition_distance_ratio": 0.08081719222084635
+          },
+          "w given, fairness 0": {
+            "income_mean": 18.673143495813445,
+            "assigned": 8791.0,
+            "completed": 7996.0,
+            "service_rate": 0.7886426841302593,
+            "mean_service_time": 6.587507010025391,
+            "detour_total": 2301.172859077756,
+            "revenue": 106010.45595053141,
+            "income_gini": 0.12392214584061056,
+            "wage_gini": 0.09402062424749236,
+            "relocation_moves": 1198.0,
+            "reposition_distance_ratio": 0.08326520568389854
+          }
+        }
+      },
+      {
+        "scene": "572 cars, capacity 8, 33.85 km/h, hour Tuesday 16:00, seed 557, fairness strength 1.28353",
+        "objective": "nl(Charge heavily for every minute ...)",
+        "scenario": "f572_c8_s33.85_Tue16h_rev0.677",
+        "family": "nl",
+        "strength": 1.2835310242016125,
+        "arms": {
+          "w hidden": {
+            "income_mean": -17.279545454545456,
+            "assigned": 5886.0,
+            "completed": 5280.0,
+            "service_rate": 0.7343730505302558,
+            "mean_service_time": 6.8843384218640535,
+            "detour_total": 2088.741643470617,
+            "revenue": 65587.08316230256,
+            "income_gini": 0.14367835797934925,
+            "wage_gini": 0.16224040436408615,
+            "relocation_moves": 909.0,
+            "reposition_distance_ratio": 0.08290184922847886
+          },
+          "w given": {
+            "income_mean": -18.614306526806526,
+            "assigned": 5482.0,
+            "completed": 4991.0,
+            "service_rate": 0.683967560823456,
+            "mean_service_time": 6.611579379677424,
+            "detour_total": 941.9972838471334,
+            "revenue": 59299.73623387152,
+            "income_gini": 0.11204207417940304,
+            "wage_gini": 0.11852788133933534,
+            "relocation_moves": 771.0,
+            "reposition_distance_ratio": 0.07126933883274086
+          },
+          "w given, fairness 0": {
+            "income_mean": -18.55757575757576,
+            "assigned": 5561.0,
+            "completed": 5012.0,
+            "service_rate": 0.6938240798502807,
+            "mean_service_time": 6.653425741314926,
+            "detour_total": 2609.48396611918,
+            "revenue": 61560.884818216895,
+            "income_gini": 0.14146357737946746,
+            "wage_gini": 0.11594072704429226,
+            "relocation_moves": 910.0,
+            "reposition_distance_ratio": 0.08968065331980192
+          }
+        }
+      },
+      {
+        "scene": "145 cars, capacity 6, 36.94 km/h, hour Tuesday 12:00, seed 558, fairness strength 0",
+        "objective": "nl(Charge heavily for every minute ...)",
+        "scenario": "f145_c6_s36.94_Tue12h_rev0.414",
+        "family": "nl",
+        "strength": 0.0,
+        "arms": {
+          "w hidden": {
+            "income_mean": -60.81540229885058,
+            "assigned": 2056.0,
+            "completed": 1940.0,
+            "service_rate": 0.33704918032786885,
+            "mean_service_time": 4.912506472025698,
+            "detour_total": 200.96464501723028,
+            "revenue": 14354.956751507496,
+            "income_gini": 0.19179586796939296,
+            "wage_gini": 0.09713786022016135,
+            "relocation_moves": 79.0,
+            "reposition_distance_ratio": 0.026325521149229657
+          },
+          "w given": {
+            "income_mean": -64.5873563218391,
+            "assigned": 1939.0,
+            "completed": 1828.0,
+            "service_rate": 0.3178688524590164,
+            "mean_service_time": 5.233917878244495,
+            "detour_total": 612.5992164435289,
+            "revenue": 14605.713125918504,
+            "income_gini": 0.15736903954994963,
+            "wage_gini": 0.09374036671713859,
+            "relocation_moves": 75.0,
+            "reposition_distance_ratio": 0.02707570085888935
+          },
+          "w given, fairness 0": {
+            "income_mean": -64.5873563218391,
+            "assigned": 1939.0,
+            "completed": 1828.0,
+            "service_rate": 0.3178688524590164,
+            "mean_service_time": 5.233917878244495,
+            "detour_total": 612.5992164435289,
+            "revenue": 14605.713125918504,
+            "income_gini": 0.15736903954994963,
+            "wage_gini": 0.09374036671713859,
+            "relocation_moves": 75.0,
+            "reposition_distance_ratio": 0.02707570085888935
+          }
+        }
+      }
+    ],
+    "table": "## CELL 1  --  537 cars, capacity 2, 28.07 km/h, hour Wednesday 08:00, seed 555, fairness strength 0\nobjective for this cell, as it was authored:\n    nl(Charge heavily for every minute ...)\n    This platform reward was authored FROM the preference below and is now the FIXED objective you compose the fleet to maximise.\n    \n    Reward understanding: The preference wants to charge for every minute a passenger spends waiting on the platform before a driver is dispatched, and to count each rider in a group separately (a 3-person party waiting 5 minutes costs 3×5=15 rider-minutes, not 5). The signal that encodes exactly this is event['assigned_dispatch_wait'], the per-order minutes-from-request-to-dispatch, which must be weighted by assigned_party_sizes[oid] so each waiting seat carries its own per-minute price. This is a pure per-order additive price: so much per rider-minute of platform waiting, summed across all newly assigned orders in the step. Nothing here is a threshold, ratio, or rate that changes with volume, so the additivity rule is not violated — I price the dispatch_wait term linearly per rider-minute, which is exactly what additivity permits.\n    \n    Objective: A driver maximising this reward will actively minimise the time passengers spend waiting on the platform before dispatch, caring more about routes that serve large groups quickly than about any other quantity.\n    \n    How it scores (per driver, per step):\n    The reward is a single negative charge on platform waiting, applied at the assignment step (when the wait is actually incurred and known). For each newly assigned order oid, the cost is event['assigned_dispatch_wait'][oid] multiplied by event['assigned_party_sizes'][oid], so a 4-person group waiting 10 minutes costs 40 rider-minutes while a solo rider waiting 1 minute costs 1. The only price is the per-rider-minute coefficient on dispatch_wait; all other terms (pickup time, ride time, detour, throughput, movement) are priced at exactly zero, since the preference names only platform pre-dispatch waiting. Because credit is taken at assignment, the dispatcher is shaped to send drivers to the longest-waiting, largest parties first; letting any other term carry a price would dilute the preference.\n    \n    NOTE: the reward's term weights were NORMALISED so they sum to 1 (each term's price is its share of the total absolute weight; scale does not matter, only the ratios between terms).\n    \n    ```python\n    def reward(event):\n        total = 0.0\n        for oid in event['assigned_orders']:\n            w = event['assigned_dispatch_wait'].get(oid, 0.0)\n            n = event['assigned_party_sizes'].get(oid, 1)\n            total += -w * n\n        return float(total)\n    ```\n\nmetric                     |    w hidden |     w given | w given, fairness 0 |  vs w hidden |            vs w hidden\n--------------------------------------------------------------------------------------------------------------------\nincome_mean                |      -12.28 |      -12.22 |              -12.22 |        +0.4% |                  +0.4%\nassigned                   |       5,111 |       5,013 |               5,013 |        -1.9% |                  -1.9%\ncompleted                  |       4,657 |       4,472 |               4,472 |        -4.0% |                  -4.0%\nservice_rate               |      0.4715 |      0.4625 |              0.4625 |        -1.9% |                  -1.9%\nmean_service_time          |       7.026 |       7.619 |               7.619 |        +8.4% |                  +8.4%\ndetour_total               |       425.8 |       3,977 |               3,977 |      +834.0% |                +834.0%\nrevenue                    |      36,458 |      36,394 |              36,394 |        -0.2% |                  -0.2%\nincome_gini                |      0.1451 |      0.1539 |              0.1539 |        +6.1% |                  +6.1%\nwage_gini                  |     0.09709 |      0.1089 |              0.1089 |       +12.2% |                 +12.2%\nrelocation_moves           |       1,150 |       1,119 |               1,119 |        -2.7% |                  -2.7%\nreposition_distance_ratio  |      0.1109 |      0.1154 |              0.1154 |        +4.0% |                  +4.0%\n\n## CELL 2  --  852 cars, capacity 5, 37 km/h, hour Wednesday 19:00, seed 556, fairness strength 0.233678\nobjective for this cell, as it was authored:\n    nl(Pay per shared seat filled and c...)\n    This platform reward was authored FROM the preference below and is now the FIXED objective you compose the fleet to maximise.\n    \n    Reward understanding: The preference wants to pay per passenger seat filled in shared rides (party size of each assigned order) and charge for each unit of pickup_distance the driver travels, while completely ignoring fare/revenue. So I reward assigned_party_sizes per order (seats filled) and penalise pickup travel. Since there is no direct 'pickup_distance' key, the cleanest additive proxy for pickup driving is assigned_pickup_times per order (minutes travelling to reach pickup); I charge per unit of that. Fare (solo_time*party) is deliberately never priced.\n    \n    Objective: A driver maximising this fills as many shared passenger seats as possible while minimising the pickup travel needed to reach each assigned order.\n    \n    How it scores (per driver, per step):\n    For each newly assigned order it PAYS a fixed amount per passenger seat (assigned_party_sizes) so bigger groups are worth proportionally more, and CHARGES a per-unit cost on that order's pickup travel time (the pickup_distance proxy). Fare/revenue is never added. The seat pay (+2 per seat) dominates so orders are still accepted, but the pickup charge (-0.5 per minute) discourages far-flung pickups. Each order is priced independently and summed, keeping the objective additive.\n    \n    NOTE: the reward's term weights were NORMALISED so they sum to 1 (each term's price is its share of the total absolute weight; scale does not matter, only the ratios between terms).\n    \n    ```python\n    def reward(event):\n        total = 0.0\n        SEAT_PAY = 2.0\n        PICKUP_CHARGE = 0.5\n        for oid in event['assigned_orders']:\n            seats = event['assigned_party_sizes'].get(oid, 0)\n            pickup = event['assigned_pickup_times'].get(oid, 0.0)\n            total += SEAT_PAY * float(seats)\n            total -= PICKUP_CHARGE * float(pickup)\n        return float(total)\n    ```\n\nmetric                     |    w hidden |     w given | w given, fairness 0 |  vs w hidden |            vs w hidden\n--------------------------------------------------------------------------------------------------------------------\nincome_mean                |       18.16 |       18.49 |               18.67 |        +1.8% |                  +2.8%\nassigned                   |       9,144 |       8,780 |               8,791 |        -4.0% |                  -3.9%\ncompleted                  |       8,229 |       7,953 |               7,996 |        -3.4% |                  -2.8%\nservice_rate               |      0.8203 |      0.7877 |              0.7886 |        -4.0% |                  -3.9%\nmean_service_time          |       6.776 |       6.636 |               6.588 |        -2.1% |                  -2.8%\ndetour_total               |       3,398 |       2,274 |               2,301 |       -33.1% |                 -32.3%\nrevenue                    |     104,087 |     105,378 |             106,010 |        +1.2% |                  +1.8%\nincome_gini                |      0.1132 |      0.1045 |              0.1239 |        -7.7% |                  +9.5%\nwage_gini                  |      0.1201 |      0.1025 |             0.09402 |       -14.7% |                 -21.7%\nrelocation_moves           |       1,594 |       1,188 |               1,198 |       -25.5% |                 -24.8%\nreposition_distance_ratio  |      0.1057 |     0.08082 |             0.08327 |       -23.6% |                 -21.2%\n\n## CELL 3  --  572 cars, capacity 8, 33.85 km/h, hour Tuesday 16:00, seed 557, fairness strength 1.28353\nobjective for this cell, as it was authored:\n    nl(Charge heavily for every minute ...)\n    This platform reward was authored FROM the preference below and is now the FIXED objective you compose the fleet to maximise.\n    \n    Reward understanding: The preference wants to heavily penalize passenger waiting on the platform before dispatch, with the penalty scaled by how many passengers are waiting together in each party. The relevant signal is `assigned_dispatch_wait[oid]` (minutes on platform before the driver was sent), and the preference explicitly asks that each seat in a multi-rider party be counted separately, so this wait must be weighted by `assigned_party_sizes[oid]`. The platform also says \"charge heavily\" for this, so the wait term should dominate every other term — I'll price the party-weighted dispatch wait at a high rate and leave all other terms at zero (or negligible) so the maximizer learns to cut platform waiting above all else. This is fully additive: each assigned order contributes its own party-weighted wait cost independently, no thresholds or ratios needed.\n    \n    Objective: A driver maximizing this reward will, at each dispatch decision, strongly prefer the wait-minimizing assignment and reduce platform waiting time for passenger parties.\n    \n    How it scores (per driver, per step):\n    For each newly assigned order oid, the reward charges a cost equal to assigned_dispatch_wait[oid] (minutes spent on the platform before dispatch) multiplied by assigned_party_sizes[oid] (seats in the party), so a party of four waiting five minutes costs 4x5=20 wait-minutes while two solo passengers each waiting five minutes costs the same — every passenger-minute counts. Nothing is paid or charged for pickup time, solo ride, detour, throughput, or empty moves, so the wait term dominates completely, matching the 'charge heavily' emphasis. On a step with no new assignments the loop adds nothing and the reward returns 0.0.\n    \n    NOTE: the reward's term weights were NORMALISED so they sum to 1 (each term's price is its share of the total absolute weight; scale does not matter, only the ratios between terms).\n    \n    ```python\n    def reward(event):\n        WAIT_RATE = 10.0  # heavy cost per passenger-minute of platform wait\n        total = 0.0\n        for oid in event['assigned_orders']:\n            wait = event['assigned_dispatch_wait'].get(oid, 0.0)\n            party = event['assigned_party_sizes'].get(oid, 1)\n            total -= WAIT_RATE * party * wait\n        return float(total)\n    ```\n\nmetric                     |    w hidden |     w given | w given, fairness 0 |  vs w hidden |            vs w hidden\n--------------------------------------------------------------------------------------------------------------------\nincome_mean                |      -17.28 |      -18.61 |              -18.56 |        -7.7% |                  -7.4%\nassigned                   |       5,886 |       5,482 |               5,561 |        -6.9% |                  -5.5%\ncompleted                  |       5,280 |       4,991 |               5,012 |        -5.5% |                  -5.1%\nservice_rate               |      0.7344 |       0.684 |              0.6938 |        -6.9% |                  -5.5%\nmean_service_time          |       6.884 |       6.612 |               6.653 |        -4.0% |                  -3.4%\ndetour_total               |       2,089 |         942 |               2,609 |       -54.9% |                 +24.9%\nrevenue                    |      65,587 |      59,300 |              61,561 |        -9.6% |                  -6.1%\nincome_gini                |      0.1437 |       0.112 |              0.1415 |       -22.0% |                  -1.5%\nwage_gini                  |      0.1622 |      0.1185 |              0.1159 |       -26.9% |                 -28.5%\nrelocation_moves           |         909 |         771 |                 910 |       -15.2% |                  +0.1%\nreposition_distance_ratio  |      0.0829 |     0.07127 |             0.08968 |       -14.0% |                  +8.2%\n\n## CELL 4  --  145 cars, capacity 6, 36.94 km/h, hour Tuesday 12:00, seed 558, fairness strength 0\nobjective for this cell, as it was authored:\n    nl(Charge heavily for every minute ...)\n    This platform reward was authored FROM the preference below and is now the FIXED objective you compose the fleet to maximise.\n    \n    Reward understanding: The preference wants to penalise passenger waiting time on the platform before dispatch, and it wants that penalty to scale with party size so a group of N people waiting is N times as costly as a solo passenger waiting the same time. The relevant signal is event['assigned_dispatch_wait'][oid] (minutes on the platform before the driver is sent), weighted by event['assigned_party_sizes'][oid]. Since the objective must be additive, I price each newly assigned order's waiting cost as a fixed per-minute-per-passenger rate times its dispatch_wait times its party size; no threshold, cap, or ratio is needed.\n    \n    Objective: Minimise the total passenger-minutes spent waiting on the platform before dispatch, weighted so larger parties hurt more.\n    \n    How it scores (per driver, per step):\n    For each order assigned this step, I charge a fixed cost of 2.0 per passenger-minute of wait: cost = party_size * assigned_dispatch_wait[oid]. The wait component is the pure before-dispatch delay, so it is priced on its own, separately from pickup and ride time. Weighting by party size makes a 4-person party waiting 5 minutes cost 40, four times a solo passenger, matching the preference that each seat be counted separately. I also add a small fixed positive bonus of 1.0 per order assigned so the dispatcher still prefers accepting a waiting order over leaving it; the dominant term, however, is the wait penalty, which drives the dispatcher to dispatch promptly and to prioritise orders that have been waiting longest and carry more passengers.\n    \n    NOTE: the reward's term weights were NORMALISED so they sum to 1 (each term's price is its share of the total absolute weight; scale does not matter, only the ratios between terms).\n    \n    ```python\n    def reward(event):\n        total = 0.0\n        for oid in event['assigned_orders']:\n            wait = event['assigned_dispatch_wait'].get(oid, 0.0)\n            party = event['assigned_party_sizes'].get(oid, 1)\n            total += -2.0 * party * wait\n            total += 1.0\n        return float(total)\n    ```\n\nmetric                     |    w hidden |     w given | w given, fairness 0 |  vs w hidden |            vs w hidden\n--------------------------------------------------------------------------------------------------------------------\nincome_mean                |      -60.82 |      -64.59 |              -64.59 |        -6.2% |                  -6.2%\nassigned                   |       2,056 |       1,939 |               1,939 |        -5.7% |                  -5.7%\ncompleted                  |       1,940 |       1,828 |               1,828 |        -5.8% |                  -5.8%\nservice_rate               |       0.337 |      0.3179 |              0.3179 |        -5.7% |                  -5.7%\nmean_service_time          |       4.913 |       5.234 |               5.234 |        +6.5% |                  +6.5%\ndetour_total               |         201 |       612.6 |               612.6 |      +204.8% |                +204.8%\nrevenue                    |      14,355 |      14,606 |              14,606 |        +1.7% |                  +1.7%\nincome_gini                |      0.1918 |      0.1574 |              0.1574 |       -17.9% |                 -17.9%\nwage_gini                  |     0.09714 |     0.09374 |             0.09374 |        -3.5% |                  -3.5%\nrelocation_moves           |          79 |          75 |                  75 |        -5.1% |                  -5.1%\nreposition_distance_ratio  |     0.02633 |     0.02708 |             0.02708 |        +2.8% |                  +2.8%"
+  },
+  "fitness": 0.9262917888527488,
+  "raw_fitness": 0.9262917888527488,
+  "fallback_rate": 0.0,
+  "defer_rate": 0.5279029221005649,
+  "per_family": {
+    "completion": 1.3923391428779561,
+    "pooling": 1.2636654326930343,
+    "raw": 0.9780368665141435,
+    "weights": -0.5464706902802253,
+    "nl": 2.930630049251884
+  },
+  "per_strength": {
+    "off": 0.9377397179049619,
+    "mild": 0.5029247460124668,
+    "strong": 1.338210902640817
+  },
+  "objective_blindness": 0.28,
+  "strength_blindness": 1.0,
+  "fitness_def": "mean over (scenario, objective, fairness strength) cells of the standardised advantage (r - mean)/std of income_mean under that cell's authored reward; the group is the programs alive that round plus two fixed anchors (the demand-gravity heuristic and repositioning OFF). Selection adds beta x the weakest objective family and beta x the weakest fairness band."
+}

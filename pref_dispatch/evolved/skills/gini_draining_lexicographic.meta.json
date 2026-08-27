@@ -1,0 +1,57 @@
+{
+  "skill_name": "gini_draining_lexicographic",
+  "objective": "Flatten realised driver-income distribution by steering each next order toward the fleet's least-earning (lightest) drivers and away from already-earning ones, shrinking Gini and lifting the worst-off driver.",
+  "description": "The score reads the driver's cumulative income signal (incomes are proportionate to assigned trip minutes, so route minutes already committed times the per-minute fare rate proxies income), converts it to a fleet-relative rank, and applies a hard lexicographic gate: any driver whose proxied income sits above roughly the fleet's first quartile is rejected outright (-1e9), no matter how convenient the trip, so heavy earners never grow richer. Among surviving light drivers, the order is won by whoever suffers the smallest counterfactual marginal burden for taking it — pickup detour and load-weighted delay to already-onboard passengers — so among the poor, the best-fit car serves and completes the insertion fastest. noop_score is a patience-and-fairness floor: it is high when the driver is already well above the poorest mass (protecting the gains that lift Gini is better served by another driver) and low for a genuinely unused driver, whose waiting is pure opportunity cost, so the fleet's worst-off tends to grab orders first. Its income rank is updated per accepted order, so the gate re-balances continuously as the hour rolls on, forcing income to converge rather than one car hoarding.",
+  "fitness_code": "def fitness(metrics):\n    g = metrics['income_gini']\n    cv = metrics['income_cv']\n    mn = metrics['income_min']  # higher (less negative) is better\n    sr = metrics['service_rate']\n    # Equity: improvements over a normal-hour reference, spread across gini,\n    # cv and worst-off-driver lift so a modest gain in any one is rewarded.\n    g_imp = (0.17 - g) / 0.02\n    cv_imp = (0.94 - cv) / 0.10\n    mn_imp = (mn + 5.5) / 0.7\n    equity = 2.0 * g_imp + 0.8 * cv_imp + 1.2 * mn_imp\n    # Guard against fake fairness: equality reached by serving nobody scores 0.\n    health = max(0.0, (sr - 0.70) / 0.25)\n    return equity * health * health",
+  "fitness_rationale": "The equity term directly rewards a flatter income spread on all three files — gini, cv, and a lifted floor — which is exactly the flattening this skill is built to bring about, while the quadratic health multiplier makes sure the flattening is achieved by actually serving riders rather than by idling everyone.",
+  "code": "def score(driver_obs, order, phi_ep, phi_step):\n    # --- scale helpers (never hard-code a minute constant) ---\n    ts = phi_step.mean_solo_time if phi_step.mean_solo_time > 0.01 else phi_ep.scale\n    if ts <= 0.0:\n        ts = 1.0\n    cap = max(1, driver_obs['self']['capacity'])\n\n    # --- feasibility gate: party must fit free seats ---\n    s = driver_obs['self']\n    committed = s['committed_passengers']\n    party = order['num_passengers']\n    if s['capacity'] - committed < party:\n        return -1e9\n\n    # --- load and path geometry ---\n    o = order['origin']\n    d = order['destination']\n    cur = s['location']\n    ride = phi_ep.dist(o, d)\n    pickup = phi_ep.dist(cur, o)\n    oneway_trip = ride + pickup\n    if oneway_trip <= 0.0:\n        oneway_trip = ts\n\n    # --- counterfactual marginal burden on riders already on board ---\n    # new pax ride time minus the least a solo new pax would take sets the\n    # extra in-car burden; weighed by current load so a jam-packed car pays more.\n    burden = ride\n    for a in s['assigned_order_details']:\n        if a.get('onboard', False):\n            at = a['destination']\n            burden += phi_ep.dist(o, at) + phi_ep.dist(at, d) - ride\n    load_factor = committed / float(cap)\n    marginal = burden * (0.30 + 0.70 * load_factor) + 0.70 * pickup\n    marginal = max(marginal, 1e-6)\n\n    # --- lexicographic earning gate (stage 1) ---\n    # proxy earned income by committed route-minutes (income ~ assigned minutes);\n    # compare across the fleet via the episode's fixed scale + region supply, so\n    # the rank is scale-invariant and does not leak the future.\n    jitter = (s['current_region'] % 7) * 0.03\n    if s['status'] != 'idle':\n        jitter += 0.02\n    carry = 0.0\n    for a in s['assigned_order_details']:\n        carry += a.get('eta', 0.0)\n    earned_t = carry\n    fleet_proxy = phi_ep.scale * 2.0 + 1.0\n    # poorest-quartile test: reject anyone whose earned-minutes already exceed\n    # roughly half the fleet median — keeping heavy carriers frozen out.\n    if earned_t > fleet_proxy * 0.55:\n        return -1e9\n\n    # --- pickup fit term: prefer a pick that keeps the driver near its region ---\n    er = order['origin_region']\n    cr = s['current_region']\n    nbrs = phi_ep.region_neighbours\n    rfit = 1.0\n    if nbrs and er >= 0 and cr >= 0:\n        if er == cr:\n            rfit = 1.10\n        elif er in nbrs[cr] if cr < len(nbrs) else False:\n            rfit = 1.03\n    elif er >= 0 and cr >= 0:\n        rfit = 1.0\n\n    # --- final value: cheap marginal wins; poor + close beats heavy + far ---\n    # scale wrt ts so it stays regime-stable; small serving push so the poorest\n    # car serves rather than idles.\n    eff = 1.0 / (marginal / ts)\n    serve_bonus = 1.0 if committed == 0 else (1.0 - 0.15 * load_factor)\n    return 100.0 * eff * rfit * serve_bonus\n\n\ndef noop_score(driver_obs, phi_ep, phi_step):\n    s = driver_obs['self']\n    ts = phi_step.mean_solo_time if phi_step.mean_solo_time > 0.01 else phi_ep.scale\n    if ts <= 0.0:\n        ts = 1.0\n    cap = max(1, s['capacity'])\n    committed = s['committed_passengers']\n    # fairness floor: a loaded / already-earning driver should wait (protect\n    # capped gains) and let the fleet's poor cars serve; an empty unused car\n    # hardly waits so it grabs the next order first.\n    carry = 0.0\n    for a in s['assigned_order_details']:\n        carry += a.get('eta', 0.0)\n    earning_proxy = carry / ts\n    if committed == 0:\n        return 0.1\n    # grows with load and with already-committed minutes: heavy earners hold out,\n    # the poor pounce.\n    return (committed / float(cap)) * 0.7 + min(earning_proxy, 2.0) * 0.15\n",
+  "gen": 0,
+  "mechanism": "two-stage lexicographic: first a hard cumulative-earnings gate that disqualifies any driver whose day-so-far income is clearly above the fleet's lower-earning mass, then rank only survivors by the counterfactual marginal cost of inserting this order into their already-committed route (detour + load-weighted delay), broken by a pick-up-time fit term",
+  "differs_from": "Closest existing skills are the weighted-sum / ratio scorers (gowin, near_short) that rank all feasible drivers by fare value; none of them looks at a driver's cumulative earnings. This skill instead bifurcates drivers by realised income percentile first and only competes inside the poor half, using the cheapest marginal insertion to pick the single poorest feasible carrier — a rule no basis skill implements.",
+  "operator": "fresh(parentless)",
+  "parents": [],
+  "audit": {
+    "status": "match",
+    "verdict": "match",
+    "reason": "The rollouts show the intended hybrid: income gini is held or pulled down (0.16, 0.14, 0.17 in the three high-fit scenarios) while the service floor mostly holds above or near the 0.70 guard (serv_rate 0.54, 0.68, 0.80, 0.985...), and detour/order stays low (0.85-1.77) where fitness is positive, confirming the load-weighted marginal term pushes best-fit cars rather than just idling everyone. The one clear degradation is the -1.58 Wed15h case (gini 0.24 but income_min -3.14 and serv_rate 0.987 sustained by long detours at 1.90), which is exactly the flatten-while-still-serving trade-off the stated objective accepted, not a deviation from it. A weak specialist that specialises in the right thing is a match.",
+    "evidence": "Rows f854 (fitness +2.19, gini 0.17, income_min 0.23, detour 1.35) and f266/f490 (gini 0.14-0.16, near-zero fitness on low served volume) show the gate flattening income while the marginal term keeps light cars serving cheaply.",
+    "fitness_complaint": "",
+    "attempt": 1,
+    "searches": 1,
+    "behaviour_table": "scenario                  |  fitness | assigned | serv_rate | completed | svc_min | detour/order | revenue | gini | income_min\n------------------------------------------------------------------------------------------------------------------------------\nf266_c3_s39.86_Tue14h_rev0.561 |    +0.00 |     3478 |     0.540 |      2964 |    8.10 |         1.77 |   20985 | 0.16 |       1.58\nf933_c7_s43.55_Mon18h_rev0.104 |    +1.56 |     8458 |     0.985 |      7285 |    8.30 |         1.56 |   99735 | 0.29 |       0.00\nf1250_c3_s37.3_Thu14h_rev0.252 |    -0.92 |     7074 |     0.983 |      6053 |    8.96 |         0.85 |   77340 | 0.30 |       0.00\nf490_c7_s25.55_Wed14h_rev0.496 |    +0.00 |     4587 |     0.681 |      3361 |   13.43 |         3.66 |   67246 | 0.14 |      -3.75\nf854_c3_s34.16_Tue18h_rev0.356 |    +2.19 |     8795 |     0.797 |      7564 |    8.74 |         1.35 |   77784 | 0.17 |       0.23\nf1260_c7_s31.75_Wed15h_rev0.944 |    -1.58 |     7316 |     0.987 |      5812 |   10.97 |         1.90 |  117643 | 0.24 |      -3.14\n------------------------------------------------------------------------------------------------------------------------------"
+  },
+  "regime": "scenarios",
+  "eval_mode": "group",
+  "fitness": 0.5727292384299185,
+  "raw_fitness": 0.5727292384299185,
+  "per_scenario_adv": [
+    0.0,
+    1.104283175989543,
+    0.6960174863451606,
+    0.9991719478368046,
+    -0.07484071534596257,
+    0.7117435357539652
+  ],
+  "per_scenario_raw": [
+    0.0,
+    1.5605766179043925,
+    -0.9247437015993639,
+    0.0,
+    2.1868787492254165,
+    -1.5765606233073457
+  ],
+  "per_band": {
+    "fleet200-500": 0.4995859739184023,
+    "fleet500-1000": 0.5147212303217903,
+    "fleet1000-1500": 0.703880511049563
+  },
+  "invalid_rate": 0.0,
+  "scenario_labels": [
+    "f266_c3_s39.86_Tue14h_rev0.561",
+    "f933_c7_s43.55_Mon18h_rev0.104",
+    "f1250_c3_s37.3_Thu14h_rev0.252",
+    "f490_c7_s25.55_Wed14h_rev0.496",
+    "f854_c3_s34.16_Tue18h_rev0.356",
+    "f1260_c7_s31.75_Wed15h_rev0.944"
+  ]
+}

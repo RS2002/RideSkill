@@ -1,0 +1,57 @@
+{
+  "skill_name": "slack_budget_gate_ranked",
+  "objective": "Minimise mean end-to-end passenger service time by only pooling a new rider when it barely delays the passengers already onboard, otherwise taking fast solo trips.",
+  "description": "For an empty car the order is a pure solo trip, so it is always feasible and is ranked by how fast it can be served (short pickup + short ride win) — a solo trip incurs zero pooling delay. For a loaded car the score estimates the marginal detour the new pickup-then-drop insertion adds to the existing route and hard-rejects the order if that detour would push any onboard passenger's extra wait past a tight budget (a small fraction of one solo trip), scaled a little looser only when demand pressure is high so throughput does not collapse. Survivors are ranked by the NEGATIVE total added service minutes, so the cheapest-to-insert rider always wins. It prefers to wait (positive noop floor) when a car already carries riders whose slack is nearly spent, refusing any marginally-delaying pool and holding capacity for a genuinely free insert.",
+  "fitness_code": "def fitness(metrics):\n    # Primary: low mean end-to-end service time; secondary: keep detour low\n    # while still completing a healthy volume (guard against serving nothing).\n    mst = metrics['mean_service_time']\n    detour = metrics['detour_total']\n    completed = metrics['completed']\n    # Normalise onto comparable scales: mst ~11..18, detour ~1e4..4e4, completed ~1.2e3..6.2e3.\n    service_penalty = mst + detour / 6000.0\n    return completed / 1000.0 - service_penalty",
+  "fitness_rationale": "Mean service time is the direct objective; the detour term penalises pooling that lengthens onboard riders' journeys, and the completed term guards against a gate so strict it serves nothing.",
+  "code": "def score(driver_obs, order, phi_ep, phi_step):\n    me = driver_obs['self']\n    cap = me['capacity']\n    if cap <= 0:\n        return -1e9\n    # live scale unit\n    scale = phi_step.mean_solo_time\n    if scale is None or scale <= 1e-6:\n        scale = phi_ep.scale\n    if scale <= 1e-6:\n        scale = 1.0\n\n    o_org = order['origin']\n    o_dst = order['destination']\n    party = order.get('num_passengers', 1)\n    loc = me['location']\n    dist = phi_ep.dist\n\n    details = me.get('assigned_order_details', [])\n\n    # count committed load\n    onboard_load = 0\n    onboard = []\n    for d in details:\n        if d.get('onboard', False):\n            onboard_load += d.get('num_passengers', 1)\n            onboard.append(d)\n    committed = me.get('committed_passengers', onboard_load)\n\n    # capacity feasibility\n    if committed + party > cap:\n        return -1e9\n\n    # pickup deadhead from current location\n    fetch = dist(loc, o_org)\n    ride = dist(o_org, o_dst)\n\n    # EMPTY car: pure solo trip, zero pooling delay -> always feasible\n    if onboard_load == 0 and len(details) == 0:\n        # rank by how fast we can serve: short pickup + short ride win\n        total = fetch + ride\n        return 2.0 * scale - total / scale\n\n    # LOADED (or committed) car: charge marginal detour on onboard riders.\n    # Estimate added service minutes: the new pickup+drop insertion forces the\n    # car to divert. Approximate the per-onboard extra wait as the detour of\n    # visiting the new origin then destination relative to going straight.\n    # marginal added travel = fetch + ride + tail - straight\n    # Use the last known onboard destination as the straight continuation.\n    ref_dst = None\n    max_eta = -1.0\n    for d in onboard:\n        e = d.get('eta', 0.0)\n        if e is not None and e > max_eta:\n            max_eta = e\n            ref_dst = d.get('destination', None)\n    if ref_dst is None:\n        # fall back to any assigned detail\n        for d in details:\n            if d.get('destination') is not None:\n                ref_dst = d['destination']\n                break\n    if ref_dst is None:\n        ref_dst = o_dst\n\n    straight = dist(loc, ref_dst)\n    detour_path = fetch + ride + dist(o_dst, ref_dst)\n    added = detour_path - straight\n    if added < 0.0:\n        added = 0.0\n\n    # per-onboard extra wait budget: tight fraction of a solo trip.\n    # loosen a little when demand pressure is high (throughput protection).\n    dp = phi_step.demand_pressure\n    budget_frac = 0.20\n    if dp is not None and dp > 1.0:\n        budget_frac = 0.20 + 0.15 * min(dp - 1.0, 2.0)\n    budget = budget_frac * scale\n\n    # each onboard passenger roughly eats `added` extra minutes; hard gate\n    if added > budget:\n        return -1e9\n\n    # survivors ranked by smallest total added minutes (fetch also matters)\n    total_added = added + 0.5 * fetch\n    return 1.0 * scale - total_added / scale\n\n\ndef noop_score(driver_obs, phi_ep, phi_step):\n    me = driver_obs['self']\n    details = me.get('assigned_order_details', [])\n    onboard = [d for d in details if d.get('onboard', False)]\n    if not onboard:\n        # idle / free car: no reason to hold out, floor at zero\n        return 0.0\n    scale = phi_step.mean_solo_time\n    if scale is None or scale <= 1e-6:\n        scale = phi_ep.scale\n    if scale <= 1e-6:\n        scale = 1.0\n    # If onboard riders are close to their drop (small eta), their slack is\n    # nearly spent: hold out, refuse any marginally-delaying pool.\n    min_eta = min((d.get('eta', 0.0) or 0.0) for d in onboard)\n    tightness = 1.0 - min(min_eta / scale, 1.0)\n    # positive floor rises as onboard slack shrinks\n    return 0.30 * scale * tightness / scale\n",
+  "gen": 5,
+  "mechanism": "hard per-passenger delay-budget gate (empty vs loaded car) then rank survivors by absolute added service time, smallest first",
+  "differs_from": "Closest to corridor_gated_starvation_seeding_pool, but instead of a direction/corridor alignment test it charges the ACTUAL extra minutes each onboard rider would wait from the detour and hard-rejects if any single onboard passenger's delay exceeds a small fraction of a solo trip; among survivors it ranks by the least total added minutes rather than riders-per-detour, so it directly optimises mean service time instead of throughput per deadhead.",
+  "operator": "fresh(parentless)",
+  "parents": [],
+  "audit": {
+    "status": "match",
+    "verdict": "match",
+    "reason": "The measured behaviour is exactly the intended one: low mean service time and low per-order detour where the skill wins. The best scenario f880 posts svc_min 6.18 and detour/order 0.89 for fitness +3.39, and f347 runs pure-solo (detour/order 0.00, svc_min 5.95) as promised for an empty/light car. Across all rows detour/order stays tight (0.00–0.94) and svc_min stays 5.95–10.11, consistent with 'barely delays onboard riders, otherwise fast solo.' Fitness swings are driven mainly by the completed term (2619–11451), which tracks scenario demand density rather than a broken objective, and within-round comparison is what actually ranked variants.",
+    "evidence": "svc_min (5.95–10.11) and detour/order (0.00–0.94) columns across all rows confirm low service time and low detour; f347 detour 0.00 confirms solo behaviour.",
+    "fitness_complaint": "",
+    "attempt": 1,
+    "searches": 1,
+    "behaviour_table": "scenario                  |  fitness | assigned | serv_rate | completed | svc_min | detour/order | revenue | gini | income_min\n------------------------------------------------------------------------------------------------------------------------------\nf1394_c6_s28.73_Fri09h_rev0.806 |    -4.83 |     7657 |     0.982 |      6426 |   10.11 |         0.89 |  137499 | 0.20 |      -2.57\nf236_c10_s29.67_Wed13h_rev0.513 |    -4.69 |     2878 |     0.434 |      2619 |    6.86 |         0.94 |   26741 | 0.15 |       0.22\nf880_c8_s42.61_Fri19h_rev0.904 |    +3.39 |    12662 |     0.835 |     11451 |    6.18 |         0.89 |  126192 | 0.13 |      -0.21\nf1471_c3_s28.73_Sun18h_rev0.9 |    -3.57 |     8527 |     0.980 |      7197 |   10.02 |         0.53 |  125883 | 0.19 |      -1.79\nf347_c1_s32.45_Sun12h_rev0.788 |    -2.55 |     3680 |     0.440 |      3401 |    5.95 |         0.00 |   13623 | 0.09 |       4.13\nf733_c4_s25.42_Sat12h_rev0.459 |    -4.24 |     6055 |     0.614 |      5246 |    8.90 |         0.58 |   87143 | 0.10 |      -2.83\n------------------------------------------------------------------------------------------------------------------------------"
+  },
+  "regime": "scenarios",
+  "eval_mode": "group",
+  "fitness": 0.6997435846684561,
+  "raw_fitness": 0.6997435846684561,
+  "per_scenario_adv": [
+    0.9074151660663496,
+    0.8011798109106311,
+    0.6526437828104391,
+    0.8822393023243924,
+    -0.08947971744139899,
+    1.0444631633403232
+  ],
+  "per_scenario_raw": [
+    -4.830049765137643,
+    -4.6926923001621095,
+    3.390282198387254,
+    -3.5684347668958436,
+    -2.5480360395229216,
+    -4.238349063059143
+  ],
+  "per_band": {
+    "fleet1000-1500": 0.894827234195371,
+    "fleet200-500": 0.35585004673461607,
+    "fleet500-1000": 0.8485534730753812
+  },
+  "invalid_rate": 0.0,
+  "scenario_labels": [
+    "f1394_c6_s28.73_Fri09h_rev0.806",
+    "f236_c10_s29.67_Wed13h_rev0.513",
+    "f880_c8_s42.61_Fri19h_rev0.904",
+    "f1471_c3_s28.73_Sun18h_rev0.9",
+    "f347_c1_s32.45_Sun12h_rev0.788",
+    "f733_c4_s25.42_Sat12h_rev0.459"
+  ]
+}

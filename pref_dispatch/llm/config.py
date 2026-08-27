@@ -32,7 +32,7 @@ class LLMConfig:
     # from ``os.environ[api_key_env]`` (or a git-ignored .env) at client build
     # time -- it is deliberately NOT a field here so it cannot be pickled,
     # logged, or committed by accident.
-    api_key_env: str = "YIBU_API_KEY"
+    api_key_env: str = "API_KEY"
 
     # Evolution wants diversity -> high default temperature. Deterministic
     # passes (final-product eval, sandbox trial runs) override this with 0.0

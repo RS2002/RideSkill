@@ -43,6 +43,14 @@ data/nyc/                 Manhattan road network + preprocessed NYC FHVHV
 examples/quick_test.py    load the frozen stack and roll one episode
 ```
 
+## Data
+
+`data/nyc/` ships the Manhattan road network and the preprocessed NYC FHVHV
+order windows used in the paper. The raw trip records are public data from the NYC Taxi & Limousine
+Commission; the preprocessing scripts are part of the RideGym package. 
+
+Due to the copyright, please process the data follow [RS2002/RideGym: Official Repository for The Paper, RideGym: A Standardized Interface for Real-World Large-Scale Ride-Sharing System](https://github.com/RS2002/RideGym) and put the processed data in `data/nyc/` .
+
 ## Quick test (no LLM needed)
 
 The frozen artifacts are included, so the trained stack can be evaluated
@@ -109,26 +117,7 @@ end-to-end:
 python -m pref_dispatch.llm._verify_partB
 ```
 
-## Evaluation
 
-The benchmark harness compares the frozen stack against heuristic baselines
-(nearest-distance, Hungarian, Gale--Shapley) and, if you provide checkpoints,
-MARL agents, over scenario grids (fleet / hour / speed / capacity axes):
-
-```bash
-python -m benchmark.run_exp2_generalization      # the five-axis generalization grid
-python -m benchmark.run_exp1_in_domain           # the in-domain table
-```
-
-Each experiment writes per-cell records and a summary under `cache/`.
-
-## Data
-
-`data/nyc/` ships the Manhattan road network and the preprocessed NYC FHVHV
-order windows used in the paper. The raw trip records are public data from the NYC Taxi & Limousine
-Commission; the preprocessing scripts are part of the RideGym package. 
-
-Due to the copyright, please process the data follow [RS2002/RideGym: Official Repository for The Paper, RideGym: A Standardized Interface for Real-World Large-Scale Ride-Sharing System](https://github.com/RS2002/RideGym) and put the processed data in `data/nyc/` .
 
 ## Citation
 
